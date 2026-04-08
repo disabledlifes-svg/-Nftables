@@ -1,0 +1,1247 @@
+#!/usr/bin/env bash
+# nftables 主机防火墙 + IPv4 DNAT 管理脚本
+
+set -Eeuo pipefail
+umask 077
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+PLAIN='\033[0m'
+
+CONF_DIR="/etc/nft_manager"
+BACKUP_DIR="/etc/nft_manager_backups"
+RUNTIME_DIR="$BACKUP_DIR/runtime"
+
+ALLOW_FILE="$CONF_DIR/allow.list"
+ALLOW_RANGE_FILE="$CONF_DIR/allow_range.list"
+ALLOW_ACL_FILE="$CONF_DIR/allow_acl.list"
+FORWARD_FILE="$CONF_DIR/forward.list"
+BLOCK_IP_FILE="$CONF_DIR/block_ip.list"
+BLOCK_PORT_FILE="$CONF_DIR/block_port.list"
+RATELIMIT_FILE="$CONF_DIR/ratelimit.list"
+CONNLIMIT_FILE="$CONF_DIR/connlimit.list"
+TRACE_FILE="$CONF_DIR/trace.list"
+MANAGEMENT_FILE="$CONF_DIR/management.list"
+AUTO_RESCUE_FILE="$CONF_DIR/auto_rescue.list"
+SETTINGS_FILE="$CONF_DIR/settings.conf"
+NFT_RULE_FILE="$CONF_DIR/rules.nft"
+COMPILED_PREVIEW_FILE="$CONF_DIR/rules.preview.nft"
+LAST_ACTIVE_RULESET_FILE="$RUNTIME_DIR/last_active_ruleset.nft"
+SYSCTL_FILE="/etc/sysctl.d/99-nft-manager.conf"
+SERVICE_FILE="/etc/systemd/system/nft-manager.service"
+SERVICE_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/nft-manager.service"
+LOADER_FILE="$CONF_DIR/load_saved_rules.sh"
+LOCK_FILE="/run/nft_manager.lock"
+LOCK_DIR="${LOCK_FILE}.d"
+
+TABLE_NAT="custom_nat"
+TABLE_FW="custom_fw"
+
+INPUT_POLICY="drop"
+FORWARD_POLICY="drop"
+OUTPUT_POLICY="accept"
+ENABLE_DROP_LOG="no"
+DROP_LOG_RATE="10/second"
+WAN_IFACE=""
+AUTO_OPEN_SSH_PORT="yes"
+ALLOW_PING_V4="yes"
+PING_V4_RATE="5/second"
+ALLOW_PING_V6="yes"
+ALLOW_IPV6_ND="yes"
+ENABLE_IPV6_FORWARD="no"
+WARN_IPTABLES_NAT_CONFLICT="yes"
+ENABLE_COUNTERS="yes"
+MANAGEMENT_PORTS=""
+
+LOCK_FALLBACK_HELD=0
+
+log_info() { echo -e "${CYAN}$*${PLAIN}"; }
+log_warn() { echo -e "${YELLOW}$*${PLAIN}"; }
+log_ok() { echo -e "${GREEN}$*${PLAIN}"; }
+log_error() { echo -e "${RED}$*${PLAIN}" >&2; }
+die() { log_error "$*"; exit 1; }
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行。"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+}
+
+safe_mktemp_file() {
+  local base="${TMPDIR:-/tmp}/$1"
+  mktemp "$base"
+}
+
+safe_mktemp_dir() {
+  local base="${TMPDIR:-/tmp}/$1"
+  mktemp -d "$base"
+}
+
+trim() {
+  local s="${1-}"
+  s="${s#${s%%[![:space:]]*}}"
+  s="${s%${s##*[![:space:]]}}"
+  printf '%s' "$s"
+}
+
+strip_inline_comment() {
+  local s="${1-}"
+  local out=""
+  local c quote=''
+  local i
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    if [[ -z "$quote" ]]; then
+      case "$c" in
+        \#) break ;;
+        \"|\') quote="$c" ;;
+      esac
+    else
+      [[ "$c" == "$quote" ]] && quote=''
+    fi
+    out+="$c"
+  done
+  printf '%s' "$out"
+}
+
+normalize_line() {
+  trim "$(strip_inline_comment "${1-}")"
+}
+
+strip_wrapping_quotes() {
+  local v="${1-}"
+  if [[ "$v" =~ ^\".*\"$ ]]; then
+    v="${v:1:${#v}-2}"
+  elif [[ "$v" =~ ^\'.*\'$ ]]; then
+    v="${v:1:${#v}-2}"
+  fi
+  printf '%s' "$v"
+}
+
+normalize_iface_name() {
+  local iface
+  iface="$(trim "${1-}")"
+  iface="${iface%%@*}"
+  [[ -z "$iface" || "$iface" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+  printf '%s' "$iface"
+}
+
+normalize_rate_value() {
+  local v
+  v="$(printf '%s' "${1-}" | tr -d '[:space:]')"
+  [[ "$v" =~ ^[0-9]+/(second|minute|hour|day)$ ]] || return 1
+  printf '%s' "$v"
+}
+
+normalize_burst_value() {
+  local v
+  v="$(printf '%s' "${1-}" | tr -d '[:space:]')"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$v"
+}
+
+validate_yesno() { [[ "${1-}" =~ ^(yes|no)$ ]]; }
+validate_policy() { [[ "${1-}" =~ ^(accept|drop)$ ]]; }
+validate_proto() { [[ "${1-}" =~ ^(tcp|udp|both)$ ]]; }
+validate_plain_proto() { [[ "${1-}" =~ ^(tcp|udp)$ ]]; }
+
+to_dec() {
+  [[ "${1-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%u' "$((10#$1))"
+}
+
+normalize_port_value() {
+  local n
+  n="$(to_dec "${1-}")" || return 1
+  (( n >= 1 && n <= 65535 )) || return 1
+  printf '%s' "$n"
+}
+
+normalize_range_value() {
+  local start end
+  [[ "${1-}" =~ ^([0-9]+)-([0-9]+)$ ]] || return 1
+  start="$(normalize_port_value "${BASH_REMATCH[1]}")" || return 1
+  end="$(normalize_port_value "${BASH_REMATCH[2]}")" || return 1
+  (( start <= end )) || return 1
+  printf '%s-%s' "$start" "$end"
+}
+
+is_port_or_range() {
+  normalize_port_value "$1" >/dev/null 2>&1 || normalize_range_value "$1" >/dev/null 2>&1
+}
+
+normalize_port_or_range() {
+  if normalize_port_value "$1" >/dev/null 2>&1; then
+    normalize_port_value "$1"
+  else
+    normalize_range_value "$1"
+  fi
+}
+
+looks_like_ip_token() {
+  [[ "${1-}" == *.* || "${1-}" == *:* || "${1-}" == */* ]]
+}
+
+validate_src_cidr_token() {
+  local s="${1-}"
+  [[ -n "$s" ]] || return 1
+  [[ "$s" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]] || return 1
+}
+
+is_ipv6_token() {
+  [[ "${1-}" == *:* ]]
+}
+
+quote_nft_str() {
+  local s="${1-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+counter_stmt() {
+  [[ "$ENABLE_COUNTERS" == "yes" ]] && printf 'counter '
+}
+
+atomic_install_file() {
+  local src="$1" dst="$2" mode="${3:-600}"
+  local tmp
+  tmp="$(safe_mktemp_file nftmgr.install.XXXXXX)" || return 1
+  cp -f -- "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  mkdir -p -- "$(dirname -- "$dst")" || { rm -f "$tmp"; return 1; }
+  mv -f -- "$tmp" "$dst"
+}
+
+make_file_snapshot() {
+  local file="$1" snap
+  snap="$(safe_mktemp_file nftmgr.snap.XXXXXX)" || return 1
+  if [[ -f "$file" ]]; then
+    cp -f -- "$file" "$snap" || { rm -f "$snap"; return 1; }
+  else
+    : > "$snap" || { rm -f "$snap"; return 1; }
+  fi
+  printf '%s' "$snap"
+}
+
+restore_file_from_snapshot() {
+  local file="$1" snap="$2"
+  mkdir -p -- "$(dirname -- "$file")"
+  cp -f -- "$snap" "$file"
+}
+
+make_dir_snapshot() {
+  local dir="$1" snap
+  snap="$(safe_mktemp_dir nftmgr.dir.XXXXXX)" || return 1
+  if [[ -d "$dir" ]]; then
+    cp -a -- "$dir"/. "$snap"/ || { rm -rf "$snap"; return 1; }
+  fi
+  printf '%s' "$snap"
+}
+
+restore_dir_from_snapshot() {
+  local dir="$1" snap="$2"
+  rm -rf -- "$dir"
+  mkdir -p -- "$dir"
+  cp -a -- "$snap"/. "$dir"/
+}
+
+lock_owner_is_active() {
+  local pid="${1-}" start="${2-}" actual
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  actual="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+  [[ -n "$actual" && -n "$start" && "$actual" == "$start" ]]
+}
+
+write_lock_owner_info() {
+  local pid="$1" start
+  start="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+  printf '%s\n' "$pid" > "$LOCK_DIR/pid"
+  printf '%s\n' "$start" > "$LOCK_DIR/starttime"
+}
+
+acquire_global_lock() {
+  local stale_pid="" stale_start=""
+  if command -v flock >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+    if [[ -L "$LOCK_FILE" || ( -e "$LOCK_FILE" && ! -f "$LOCK_FILE" ) ]]; then
+      return 1
+    fi
+    exec 9>"$LOCK_FILE"
+    flock -n 9
+    return $?
+  fi
+
+  mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null || true
+  if [[ -L "$LOCK_DIR" || ( -e "$LOCK_DIR" && ! -d "$LOCK_DIR" ) ]]; then
+    return 1
+  fi
+
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_FALLBACK_HELD=1
+    write_lock_owner_info "$$"
+    trap 'if [[ "${LOCK_FALLBACK_HELD:-0}" == "1" ]]; then rm -rf "$LOCK_DIR"; fi' EXIT
+    return 0
+  fi
+
+  stale_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  stale_start="$(cat "$LOCK_DIR/starttime" 2>/dev/null || true)"
+  if [[ -n "$stale_pid" ]] && ! lock_owner_is_active "$stale_pid" "$stale_start"; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      LOCK_FALLBACK_HELD=1
+      write_lock_owner_info "$$"
+      trap 'if [[ "${LOCK_FALLBACK_HELD:-0}" == "1" ]]; then rm -rf "$LOCK_DIR"; fi' EXIT
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+reset_settings_defaults() {
+  INPUT_POLICY="drop"
+  FORWARD_POLICY="drop"
+  OUTPUT_POLICY="accept"
+  ENABLE_DROP_LOG="no"
+  DROP_LOG_RATE="10/second"
+  WAN_IFACE=""
+  AUTO_OPEN_SSH_PORT="yes"
+  ALLOW_PING_V4="yes"
+  PING_V4_RATE="5/second"
+  ALLOW_PING_V6="yes"
+  ALLOW_IPV6_ND="yes"
+  ENABLE_IPV6_FORWARD="no"
+  WARN_IPTABLES_NAT_CONFLICT="yes"
+  ENABLE_COUNTERS="yes"
+  MANAGEMENT_PORTS=""
+}
+
+apply_setting_kv() {
+  local key="$1" value="$2"
+  case "$key" in
+    INPUT_POLICY|FORWARD_POLICY|OUTPUT_POLICY|ENABLE_DROP_LOG|DROP_LOG_RATE|WAN_IFACE|AUTO_OPEN_SSH_PORT|ALLOW_PING_V4|PING_V4_RATE|ALLOW_PING_V6|ALLOW_IPV6_ND|ENABLE_IPV6_FORWARD|WARN_IPTABLES_NAT_CONFLICT|ENABLE_COUNTERS|MANAGEMENT_PORTS)
+      printf -v "$key" '%s' "$value"
+      ;;
+  esac
+}
+
+validate_settings() {
+  validate_policy "$INPUT_POLICY" || die "INPUT_POLICY 非法：$INPUT_POLICY"
+  validate_policy "$FORWARD_POLICY" || die "FORWARD_POLICY 非法：$FORWARD_POLICY"
+  validate_policy "$OUTPUT_POLICY" || die "OUTPUT_POLICY 非法：$OUTPUT_POLICY"
+  validate_yesno "$ENABLE_DROP_LOG" || die "ENABLE_DROP_LOG 非法：$ENABLE_DROP_LOG"
+  DROP_LOG_RATE="$(normalize_rate_value "$DROP_LOG_RATE")" || die "DROP_LOG_RATE 非法：$DROP_LOG_RATE"
+  WAN_IFACE="$(normalize_iface_name "$WAN_IFACE")" || die "WAN_IFACE 非法：$WAN_IFACE"
+  validate_yesno "$AUTO_OPEN_SSH_PORT" || die "AUTO_OPEN_SSH_PORT 非法：$AUTO_OPEN_SSH_PORT"
+  validate_yesno "$ALLOW_PING_V4" || die "ALLOW_PING_V4 非法：$ALLOW_PING_V4"
+  PING_V4_RATE="$(normalize_rate_value "$PING_V4_RATE")" || die "PING_V4_RATE 非法：$PING_V4_RATE"
+  validate_yesno "$ALLOW_PING_V6" || die "ALLOW_PING_V6 非法：$ALLOW_PING_V6"
+  validate_yesno "$ALLOW_IPV6_ND" || die "ALLOW_IPV6_ND 非法：$ALLOW_IPV6_ND"
+  validate_yesno "$ENABLE_IPV6_FORWARD" || die "ENABLE_IPV6_FORWARD 非法：$ENABLE_IPV6_FORWARD"
+  validate_yesno "$WARN_IPTABLES_NAT_CONFLICT" || die "WARN_IPTABLES_NAT_CONFLICT 非法：$WARN_IPTABLES_NAT_CONFLICT"
+  validate_yesno "$ENABLE_COUNTERS" || die "ENABLE_COUNTERS 非法：$ENABLE_COUNTERS"
+}
+
+load_settings() {
+  reset_settings_defaults
+  [[ -f "$SETTINGS_FILE" ]] || return 0
+  local raw line key value
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    [[ "$line" == *=* ]] || continue
+    key="$(trim "${line%%=*}")"
+    value="$(strip_wrapping_quotes "$(trim "${line#*=}")")"
+    apply_setting_kv "$key" "$value"
+  done < "$SETTINGS_FILE"
+  validate_settings
+}
+
+save_settings() {
+  local tmp
+  tmp="$(safe_mktemp_file nftmgr.settings.XXXXXX)" || return 1
+  cat > "$tmp" <<EOF_SETTINGS
+INPUT_POLICY="$INPUT_POLICY"
+FORWARD_POLICY="$FORWARD_POLICY"
+OUTPUT_POLICY="$OUTPUT_POLICY"
+ENABLE_DROP_LOG="$ENABLE_DROP_LOG"
+DROP_LOG_RATE="$DROP_LOG_RATE"
+WAN_IFACE="$WAN_IFACE"
+AUTO_OPEN_SSH_PORT="$AUTO_OPEN_SSH_PORT"
+ALLOW_PING_V4="$ALLOW_PING_V4"
+PING_V4_RATE="$PING_V4_RATE"
+ALLOW_PING_V6="$ALLOW_PING_V6"
+ALLOW_IPV6_ND="$ALLOW_IPV6_ND"
+ENABLE_IPV6_FORWARD="$ENABLE_IPV6_FORWARD"
+WARN_IPTABLES_NAT_CONFLICT="$WARN_IPTABLES_NAT_CONFLICT"
+ENABLE_COUNTERS="$ENABLE_COUNTERS"
+MANAGEMENT_PORTS="$MANAGEMENT_PORTS"
+EOF_SETTINGS
+  atomic_install_file "$tmp" "$SETTINGS_FILE" 600
+  rm -f "$tmp"
+}
+
+ensure_dirs_and_files() {
+  mkdir -p "$CONF_DIR" "$BACKUP_DIR" "$RUNTIME_DIR"
+  touch "$ALLOW_FILE" "$ALLOW_RANGE_FILE" "$ALLOW_ACL_FILE" "$FORWARD_FILE" \
+        "$BLOCK_IP_FILE" "$BLOCK_PORT_FILE" "$RATELIMIT_FILE" "$CONNLIMIT_FILE" \
+        "$TRACE_FILE" "$MANAGEMENT_FILE" "$AUTO_RESCUE_FILE"
+  [[ -f "$SETTINGS_FILE" ]] || save_settings
+}
+
+default_editor() {
+  if [[ -n "${EDITOR:-}" ]] && command -v "$EDITOR" >/dev/null 2>&1; then
+    printf '%s' "$EDITOR"
+  elif command -v nano >/dev/null 2>&1; then
+    printf 'nano'
+  else
+    printf 'vi'
+  fi
+}
+
+edit_file() {
+  local file="$1"
+  ensure_dirs_and_files
+  "$(default_editor)" "$file"
+}
+
+warn_nat_conflict() {
+  [[ "$WARN_IPTABLES_NAT_CONFLICT" == "yes" ]] || return 0
+  command -v iptables >/dev/null 2>&1 || return 0
+  local out
+  out="$(iptables -t nat -S 2>/dev/null || true)"
+  [[ -z "$out" ]] && return 0
+  if grep -Eq '^-A (PREROUTING|POSTROUTING|OUTPUT) ' <<< "$out"; then
+    log_warn "检测到 iptables nat 规则，可能与 nftables NAT 管理冲突。"
+  fi
+}
+
+detect_ssh_port() {
+  local p
+  if command -v sshd >/dev/null 2>&1; then
+    p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+    if normalize_port_value "$p" >/dev/null 2>&1; then
+      printf '%s' "$p"
+      return 0
+    fi
+  fi
+  if [[ -r /etc/ssh/sshd_config ]]; then
+    p="$(awk 'tolower($1)=="port"{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+    if normalize_port_value "$p" >/dev/null 2>&1; then
+      printf '%s' "$p"
+      return 0
+    fi
+  fi
+  printf '22'
+}
+
+management_ports_from_settings() {
+  local raw item proto port
+  raw="${MANAGEMENT_PORTS:-}"
+  [[ -n "$raw" ]] || return 0
+  raw="${raw//,/ }"
+  for item in $raw; do
+    if [[ "$item" =~ ^(tcp|udp):([0-9]+)$ ]]; then
+      proto="${BASH_REMATCH[1]}"
+      port="$(normalize_port_value "${BASH_REMATCH[2]}")" || continue
+      printf '%s %s\n' "$proto" "$port"
+    elif [[ "$item" =~ ^([0-9]+)/(tcp|udp)$ ]]; then
+      port="$(normalize_port_value "${BASH_REMATCH[1]}")" || continue
+      proto="${BASH_REMATCH[2]}"
+      printf '%s %s\n' "$proto" "$port"
+    elif normalize_port_value "$item" >/dev/null 2>&1; then
+      port="$(normalize_port_value "$item")"
+      printf 'tcp %s\n' "$port"
+    fi
+  done
+}
+
+regenerate_auto_rescue_file() {
+  local tmp ssh_port
+  tmp="$(safe_mktemp_file nftmgr.auto_rescue.XXXXXX)" || return 1
+  : > "$tmp"
+
+  management_ports_from_settings | sort -u >> "$tmp"
+
+  if [[ "$AUTO_OPEN_SSH_PORT" == "yes" && "$INPUT_POLICY" == "drop" ]]; then
+    ssh_port="$(detect_ssh_port)"
+    printf 'tcp %s\n' "$ssh_port" >> "$tmp"
+  fi
+
+  sort -u "$tmp" -o "$tmp"
+  atomic_install_file "$tmp" "$AUTO_RESCUE_FILE" 600
+  rm -f "$tmp"
+}
+
+parse_proto_port_flex() {
+  local line="$1"
+  local t1="${2-}" t2="${3-}"
+  local proto="" portspec=""
+
+  if [[ -z "$t1" ]]; then
+    return 1
+  fi
+
+  if [[ "$t1" =~ ^(tcp|udp|both):(.+)$ ]]; then
+    proto="${BASH_REMATCH[1]}"
+    portspec="${BASH_REMATCH[2]}"
+  elif [[ "$t1" =~ ^(.+)/(tcp|udp|both)$ ]]; then
+    portspec="${BASH_REMATCH[1]}"
+    proto="${BASH_REMATCH[2]}"
+  elif validate_proto "$t1"; then
+    proto="$t1"
+    portspec="$t2"
+  elif validate_proto "$t2"; then
+    portspec="$t1"
+    proto="$t2"
+  else
+    portspec="$t1"
+    proto="tcp"
+  fi
+
+  validate_proto "$proto" || { log_warn "忽略无法识别的协议/端口规则：$line"; return 1; }
+  portspec="$(normalize_port_or_range "$portspec")" || { log_warn "忽略非法端口：$line"; return 1; }
+  printf '%s %s\n' "$proto" "$portspec"
+}
+
+emit_port_rule() {
+  local chain="$1" action="$2" proto="$3" portspec="$4" extra="$5"
+  local port_clause
+  local ctr
+  ctr="$(counter_stmt)"
+  port_clause="dport $portspec"
+  if [[ "$proto" == "both" ]]; then
+    printf '    tcp %s %s %s%s\n' "$port_clause" "$extra" "$ctr" "$action"
+    printf '    udp %s %s %s%s\n' "$port_clause" "$extra" "$ctr" "$action"
+  else
+    printf '    %s %s %s %s%s\n' "$proto" "$port_clause" "$extra" "$ctr" "$action"
+  fi
+}
+
+emit_port_accept_rule() {
+  local proto="$1" portspec="$2" extra="${3:-}"
+  emit_port_rule input accept "$proto" "$portspec" "$extra"
+}
+
+emit_port_drop_rule() {
+  local proto="$1" portspec="$2" extra="${3:-}"
+  emit_port_rule input drop "$proto" "$portspec" "$extra"
+}
+
+emit_trace_rule() {
+  local proto="$1" portspec="$2"
+  local port_clause
+  port_clause="dport $portspec"
+  if [[ "$proto" == "both" ]]; then
+    printf '    tcp %s meta nftrace set 1 %saccept\n' "$port_clause" "$(counter_stmt)"
+    printf '    udp %s meta nftrace set 1 %saccept\n' "$port_clause" "$(counter_stmt)"
+  else
+    printf '    %s %s meta nftrace set 1 %saccept\n' "$proto" "$port_clause" "$(counter_stmt)"
+  fi
+}
+
+emit_allow_list_rules() {
+  local raw line p
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r -a p <<< "$line"
+    parse_proto_port_flex "$line" "${p[0]-}" "${p[1]-}" | while read -r proto portspec; do
+      emit_port_accept_rule "$proto" "$portspec"
+    done
+  done < "$ALLOW_FILE"
+}
+
+emit_allow_range_list_rules() {
+  local raw line p
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r -a p <<< "$line"
+    parse_proto_port_flex "$line" "${p[0]-}" "${p[1]-}" | while read -r proto portspec; do
+      [[ "$portspec" == *-* ]] || { log_warn "allow_range.list 仅接受端口范围：$line"; continue; }
+      emit_port_accept_rule "$proto" "$portspec"
+    done
+  done < "$ALLOW_RANGE_FILE"
+}
+
+emit_management_rules_from_file() {
+  local file="$1" raw line p
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r -a p <<< "$line"
+    parse_proto_port_flex "$line" "${p[0]-}" "${p[1]-}" | while read -r proto portspec; do
+      emit_port_accept_rule "$proto" "$portspec"
+    done
+  done < "$file"
+}
+
+emit_allow_acl_rules() {
+  local raw line src proto portspec p1 p2 p3
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r p1 p2 p3 _ <<< "$line"
+    if validate_src_cidr_token "$p1" && validate_proto "$p2" && is_port_or_range "$p3"; then
+      src="$p1"; proto="$p2"; portspec="$p3"
+    elif validate_proto "$p1" && is_port_or_range "$p2" && validate_src_cidr_token "$p3"; then
+      proto="$p1"; portspec="$p2"; src="$p3"
+    elif validate_src_cidr_token "$p1" && is_port_or_range "$p2" && validate_proto "$p3"; then
+      src="$p1"; portspec="$p2"; proto="$p3"
+    else
+      log_warn "忽略 allow_acl.list 非法规则：$line"
+      continue
+    fi
+    portspec="$(normalize_port_or_range "$portspec")" || { log_warn "忽略 allow_acl.list 端口非法：$line"; continue; }
+    if is_ipv6_token "$src"; then
+      emit_port_accept_rule "$proto" "$portspec" "ip6 saddr $src"
+    else
+      emit_port_accept_rule "$proto" "$portspec" "ip saddr $src"
+    fi
+  done < "$ALLOW_ACL_FILE"
+}
+
+emit_block_ip_rules() {
+  local raw line
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    validate_src_cidr_token "$line" || { log_warn "忽略非法 block_ip 规则：$line"; continue; }
+    if is_ipv6_token "$line"; then
+      printf '    ip6 saddr %s %sdrop\n' "$line" "$(counter_stmt)"
+    else
+      printf '    ip saddr %s %sdrop\n' "$line" "$(counter_stmt)"
+    fi
+  done < "$BLOCK_IP_FILE"
+}
+
+emit_block_port_rules() {
+  local raw line p
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r -a p <<< "$line"
+    parse_proto_port_flex "$line" "${p[0]-}" "${p[1]-}" | while read -r proto portspec; do
+      emit_port_drop_rule "$proto" "$portspec"
+    done
+  done < "$BLOCK_PORT_FILE"
+}
+
+emit_ratelimit_rules() {
+  local raw line proto portspec rate burst p1 p2 p3 p4 port_clause
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r p1 p2 p3 p4 _ <<< "$line"
+    if validate_plain_proto "$p1" && is_port_or_range "$p2"; then
+      proto="$p1"; portspec="$p2"; rate="$p3"; burst="$p4"
+    elif validate_plain_proto "$p2" && is_port_or_range "$p1"; then
+      proto="$p2"; portspec="$p1"; rate="$p3"; burst="$p4"
+    else
+      log_warn "忽略 ratelimit 非法规则：$line"
+      continue
+    fi
+    portspec="$(normalize_port_or_range "$portspec")" || { log_warn "忽略 ratelimit 端口非法：$line"; continue; }
+    rate="$(normalize_rate_value "$rate")" || { log_warn "忽略 ratelimit 速率非法：$line"; continue; }
+    [[ -z "$burst" ]] || burst="$(normalize_burst_value "$burst")" || { log_warn "忽略 ratelimit burst 非法：$line"; continue; }
+    port_clause="dport $portspec"
+    if [[ -n "$burst" ]]; then
+      printf '    %s %s limit rate over %s burst %s packets %sdrop\n' "$proto" "$port_clause" "$rate" "$burst" "$(counter_stmt)"
+    else
+      printf '    %s %s limit rate over %s %sdrop\n' "$proto" "$port_clause" "$rate" "$(counter_stmt)"
+    fi
+  done < "$RATELIMIT_FILE"
+}
+
+emit_connlimit_rules() {
+  local raw line proto portspec limit mask p1 p2 p3 p4 port_clause
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r p1 p2 p3 p4 _ <<< "$line"
+    if validate_plain_proto "$p1" && is_port_or_range "$p2"; then
+      proto="$p1"; portspec="$p2"; limit="$p3"; mask="$p4"
+    elif validate_plain_proto "$p2" && is_port_or_range "$p1"; then
+      proto="$p2"; portspec="$p1"; limit="$p3"; mask="$p4"
+    else
+      log_warn "忽略 connlimit 非法规则：$line"
+      continue
+    fi
+    portspec="$(normalize_port_or_range "$portspec")" || { log_warn "忽略 connlimit 端口非法：$line"; continue; }
+    limit="$(to_dec "$limit")" || { log_warn "忽略 connlimit 限值非法：$line"; continue; }
+    [[ -z "$mask" ]] && mask=32 || mask="$(to_dec "$mask")" || { log_warn "忽略 connlimit 掩码非法：$line"; continue; }
+    (( limit >= 1 )) || { log_warn "忽略 connlimit 限值过小：$line"; continue; }
+    (( mask >= 1 && mask <= 32 )) || { log_warn "忽略 connlimit 掩码范围非法：$line"; continue; }
+    port_clause="dport $portspec"
+    printf '    %s %s ct state new ct count over %s %sdrop\n' "$proto" "$port_clause" "$limit" "$(counter_stmt)"
+  done < "$CONNLIMIT_FILE"
+}
+
+emit_trace_rules() {
+  local raw line p
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    read -r -a p <<< "$line"
+    parse_proto_port_flex "$line" "${p[0]-}" "${p[1]-}" | while read -r proto portspec; do
+      emit_trace_rule "$proto" "$portspec"
+    done
+  done < "$TRACE_FILE"
+}
+
+count_forward_entries() {
+  local raw line count=0
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    count=$((count + 1))
+  done < "$FORWARD_FILE"
+  printf '%s' "$count"
+}
+
+parse_forward_line() {
+  local line="$1"
+  local p1 p2 p3 p4
+  read -r p1 p2 p3 p4 _ <<< "$line"
+  local wan_port proto target_ip target_port
+  if validate_plain_proto "$p1" && is_port_or_range "$p2" && looks_like_ip_token "$p3" && is_port_or_range "$p4"; then
+    proto="$p1"; wan_port="$p2"; target_ip="$p3"; target_port="$p4"
+  elif is_port_or_range "$p1" && validate_plain_proto "$p2" && looks_like_ip_token "$p3" && is_port_or_range "$p4"; then
+    wan_port="$p1"; proto="$p2"; target_ip="$p3"; target_port="$p4"
+  else
+    return 1
+  fi
+  wan_port="$(normalize_port_or_range "$wan_port")" || return 1
+  target_port="$(normalize_port_or_range "$target_port")" || return 1
+  validate_src_cidr_token "$target_ip" || return 1
+  printf '%s %s %s %s\n' "$wan_port" "$proto" "$target_ip" "$target_port"
+}
+
+emit_input_common_rules() {
+  printf '    ct state invalid %sdrop\n' "$(counter_stmt)"
+  printf '    ct state established,related %saccept\n' "$(counter_stmt)"
+  printf '    iifname "lo" %saccept\n' "$(counter_stmt)"
+
+  if [[ "$ALLOW_PING_V4" == "yes" ]]; then
+    printf '    ip protocol icmp icmp type echo-request limit rate %s %saccept\n' "$PING_V4_RATE" "$(counter_stmt)"
+  fi
+  if [[ "$ALLOW_PING_V6" == "yes" ]]; then
+    printf '    ip6 nexthdr ipv6-icmp icmpv6 type echo-request %saccept\n' "$(counter_stmt)"
+  fi
+  if [[ "$ALLOW_IPV6_ND" == "yes" ]]; then
+    printf '    ip6 nexthdr ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } %saccept\n' "$(counter_stmt)"
+  fi
+}
+
+emit_drop_tail() {
+  if [[ "$ENABLE_DROP_LOG" == "yes" ]]; then
+    printf '    limit rate %s log prefix "nft-drop: " flags all\n' "$DROP_LOG_RATE"
+  fi
+}
+
+generate_fw_table() {
+  cat <<EOF_FW
+ table inet $TABLE_FW {
+  chain input {
+    type filter hook input priority filter; policy $INPUT_POLICY;
+EOF_FW
+  emit_input_common_rules
+  emit_block_ip_rules
+  emit_block_port_rules
+  emit_ratelimit_rules
+  emit_connlimit_rules
+  emit_trace_rules
+  emit_management_rules_from_file "$MANAGEMENT_FILE"
+  emit_management_rules_from_file "$AUTO_RESCUE_FILE"
+  emit_allow_acl_rules
+  emit_allow_range_list_rules
+  emit_allow_list_rules
+  emit_drop_tail
+  cat <<EOF_FW2
+  }
+  chain forward {
+    type filter hook forward priority filter; policy $FORWARD_POLICY;
+    ct state invalid $(counter_stmt)drop
+    ct state established,related $(counter_stmt)accept
+EOF_FW2
+
+  local raw line wan_port proto target_ip target_port oif_rule
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    if ! read -r wan_port proto target_ip target_port < <(parse_forward_line "$line"); then
+      log_warn "忽略非法 forward 规则：$line"
+      continue
+    fi
+    oif_rule=""
+    [[ -n "$WAN_IFACE" ]] && oif_rule="iifname $(quote_nft_str "$WAN_IFACE") "
+    printf '    %sip daddr %s %s dport %s %saccept\n' "$oif_rule" "$target_ip" "$proto" "$target_port" "$(counter_stmt)"
+  done < "$FORWARD_FILE"
+
+  if [[ "$ENABLE_DROP_LOG" == "yes" ]]; then
+    printf '    limit rate %s log prefix "nft-fwd-drop: " flags all\n' "$DROP_LOG_RATE"
+  fi
+
+  cat <<EOF_FW3
+  }
+  chain output {
+    type filter hook output priority filter; policy $OUTPUT_POLICY;
+    ct state established,related $(counter_stmt)accept
+    oifname "lo" $(counter_stmt)accept
+  }
+ }
+EOF_FW3
+}
+
+generate_nat_table() {
+  local forward_count raw line wan_port proto target_ip target_port
+  forward_count="$(count_forward_entries)"
+  [[ "$forward_count" -gt 0 ]] || return 0
+  cat <<EOF_NAT
+ table ip $TABLE_NAT {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+EOF_NAT
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    line="$(normalize_line "$raw")"
+    [[ -z "$line" ]] && continue
+    if ! read -r wan_port proto target_ip target_port < <(parse_forward_line "$line"); then
+      continue
+    fi
+    if [[ -n "$WAN_IFACE" ]]; then
+      printf '    iifname %s %s dport %s %sdnat to %s:%s\n' "$(quote_nft_str "$WAN_IFACE")" "$proto" "$wan_port" "$(counter_stmt)" "$target_ip" "$target_port"
+    else
+      printf '    %s dport %s %sdnat to %s:%s\n' "$proto" "$wan_port" "$(counter_stmt)" "$target_ip" "$target_port"
+    fi
+  done < "$FORWARD_FILE"
+  cat <<EOF_NAT2
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+EOF_NAT2
+  if [[ -n "$WAN_IFACE" ]]; then
+    printf '    oifname %s ct state new,established,related %smasquerade\n' "$(quote_nft_str "$WAN_IFACE")" "$(counter_stmt)"
+  fi
+  cat <<EOF_NAT3
+  }
+ }
+EOF_NAT3
+}
+
+compile_ruleset() {
+  local out="$1"
+  load_settings
+  ensure_dirs_and_files
+  regenerate_auto_rescue_file
+  {
+    printf '#!/usr/sbin/nft -f\n'
+    printf '# generated by nftables-manager.safe.sh\n\n'
+    generate_fw_table
+    printf '\n'
+    generate_nat_table
+  } > "$out"
+}
+
+validate_ruleset() {
+  local file="$1"
+  nft -c -f "$file" >/dev/null
+}
+
+table_exists() {
+  nft list table "$1" "$2" >/dev/null 2>&1
+}
+
+build_apply_transaction() {
+  local compiled="$1" tx="$2"
+  {
+    printf '#!/usr/sbin/nft -f\n'
+    if table_exists inet "$TABLE_FW"; then
+      printf 'delete table inet %s\n' "$TABLE_FW"
+    fi
+    if table_exists ip "$TABLE_NAT"; then
+      printf 'delete table ip %s\n' "$TABLE_NAT"
+    fi
+    printf '\n'
+    cat "$compiled"
+  } > "$tx"
+}
+
+apply_sysctl_targets() {
+  local has_forward ipv4f ipv6f tmp
+  has_forward="$(count_forward_entries)"
+  if [[ "$has_forward" -gt 0 ]]; then
+    ipv4f=1
+  else
+    ipv4f=0
+  fi
+  [[ "$ENABLE_IPV6_FORWARD" == "yes" ]] && ipv6f=1 || ipv6f=0
+
+  tmp="$(safe_mktemp_file nftmgr.sysctl.XXXXXX)" || return 1
+  cat > "$tmp" <<EOF_SYSCTL
+# generated by nftables-manager.safe.sh
+net.ipv4.ip_forward=$ipv4f
+net.ipv6.conf.all.forwarding=$ipv6f
+net.ipv6.conf.default.forwarding=$ipv6f
+EOF_SYSCTL
+  atomic_install_file "$tmp" "$SYSCTL_FILE" 644
+  rm -f "$tmp"
+
+  sysctl -w "net.ipv4.ip_forward=$ipv4f" >/dev/null
+  sysctl -w "net.ipv6.conf.all.forwarding=$ipv6f" >/dev/null 2>&1 || true
+  sysctl -w "net.ipv6.conf.default.forwarding=$ipv6f" >/dev/null 2>&1 || true
+}
+
+write_loader_script() {
+  local tmp
+  tmp="$(safe_mktemp_file nftmgr.loader.XXXXXX)" || return 1
+  cat > "$tmp" <<'EOF_LOADER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+SYSCTL_FILE="__SYSCTL_FILE__"
+NFT_RULE_FILE="__NFT_RULE_FILE__"
+
+apply_key() {
+  local key="$1" value
+  value="$(awk -F= -v k="$key" '$1==k{print $2; exit}' "$SYSCTL_FILE" 2>/dev/null || true)"
+  [[ -n "$value" ]] || return 0
+  sysctl -w "$key=$value" >/dev/null 2>&1 || true
+}
+
+if [[ -f "$SYSCTL_FILE" ]]; then
+  apply_key net.ipv4.ip_forward
+  apply_key net.ipv6.conf.all.forwarding
+  apply_key net.ipv6.conf.default.forwarding
+fi
+
+exec nft -f "$NFT_RULE_FILE"
+EOF_LOADER
+  sed -i "s|__SYSCTL_FILE__|$SYSCTL_FILE|g; s|__NFT_RULE_FILE__|$NFT_RULE_FILE|g" "$tmp"
+  atomic_install_file "$tmp" "$LOADER_FILE" 700
+  rm -f "$tmp"
+}
+
+install_service() {
+  write_loader_script
+  local tmp
+  tmp="$(safe_mktemp_file nftmgr.service.XXXXXX)" || return 1
+  cat > "$tmp" <<EOF_SERVICE
+[Unit]
+Description=nftables managed rules loader
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$LOADER_FILE
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+  atomic_install_file "$tmp" "$SERVICE_FILE" 644
+  rm -f "$tmp"
+  systemctl daemon-reload
+  systemctl enable nft-manager.service >/dev/null 2>&1 || ln -sf "$SERVICE_FILE" "$SERVICE_WANTS_LINK"
+  log_ok "systemd service 已安装并启用。"
+}
+
+uninstall_service() {
+  systemctl disable nft-manager.service >/dev/null 2>&1 || true
+  rm -f "$SERVICE_WANTS_LINK" "$SERVICE_FILE"
+  systemctl daemon-reload || true
+  log_ok "systemd service 已卸载。"
+}
+
+backup_configs() {
+  ensure_dirs_and_files
+  local ts archive
+  ts="$(date +%Y%m%d-%H%M%S)"
+  archive="$BACKUP_DIR/nft-manager-config-$ts.tar.gz"
+  tar -C / -czf "$archive" \
+    "${CONF_DIR#/}" \
+    "${SYSCTL_FILE#/}" \
+    >/dev/null 2>&1 || tar -C / -czf "$archive" "${CONF_DIR#/}"
+  log_ok "已创建备份：$archive"
+}
+
+restore_latest_backup() {
+  local latest
+  latest="$(ls -1t "$BACKUP_DIR"/nft-manager-config-*.tar.gz 2>/dev/null | head -n1 || true)"
+  [[ -n "$latest" ]] || die "未找到备份。"
+  tar -tzf "$latest" | awk '
+    /^\// { bad=1 }
+    /(^|\/)\.\.($|\/)/ { bad=1 }
+    END { exit bad }
+  ' || die "备份包包含不安全路径，拒绝恢复。"
+  tar -xzf "$latest" -C /
+  log_ok "已恢复备份：$latest"
+}
+
+save_last_active_ruleset() {
+  local compiled="$1"
+  atomic_install_file "$compiled" "$LAST_ACTIVE_RULESET_FILE" 600
+}
+
+rollback_last_active() {
+  local tx
+  [[ -f "$LAST_ACTIVE_RULESET_FILE" ]] || die "不存在 last_active_ruleset.nft，无法回滚。"
+  tx="$(safe_mktemp_file nftmgr.rollbacktx.XXXXXX)" || die "无法创建回滚事务文件。"
+  build_apply_transaction "$LAST_ACTIVE_RULESET_FILE" "$tx"
+  validate_ruleset "$tx" || { rm -f "$tx"; die "last_active_ruleset.nft 校验失败，拒绝回滚。"; }
+  nft -f "$tx"
+  rm -f "$tx"
+  atomic_install_file "$LAST_ACTIVE_RULESET_FILE" "$NFT_RULE_FILE" 600
+  log_ok "已回滚到最近一次已知可用规则。"
+}
+
+preview_ruleset() {
+  local tmp tx
+  tmp="$(safe_mktemp_file nftmgr.preview.XXXXXX)" || return 1
+  tx="$(safe_mktemp_file nftmgr.previewtx.XXXXXX)" || { rm -f "$tmp"; return 1; }
+  compile_ruleset "$tmp"
+  build_apply_transaction "$tmp" "$tx"
+  validate_ruleset "$tx"
+  atomic_install_file "$tmp" "$COMPILED_PREVIEW_FILE" 600
+  cat "$tmp"
+  rm -f "$tmp" "$tx"
+}
+
+apply_rules() {
+  local compiled tx rules_snap preview_snap runtime_snap
+  compiled="$(safe_mktemp_file nftmgr.compiled.XXXXXX)" || return 1
+  tx="$(safe_mktemp_file nftmgr.tx.XXXXXX)" || { rm -f "$compiled"; return 1; }
+
+  compile_ruleset "$compiled"
+  build_apply_transaction "$compiled" "$tx"
+  validate_ruleset "$tx"
+
+  rules_snap="$(make_file_snapshot "$NFT_RULE_FILE")" || { rm -f "$compiled" "$tx"; return 1; }
+  preview_snap="$(make_file_snapshot "$COMPILED_PREVIEW_FILE")" || { rm -f "$compiled" "$tx" "$rules_snap"; return 1; }
+  runtime_snap="$(make_file_snapshot "$LAST_ACTIVE_RULESET_FILE")" || { rm -f "$compiled" "$tx" "$rules_snap" "$preview_snap"; return 1; }
+
+  if ! nft -f "$tx"; then
+    log_error "nft 应用失败。尝试恢复最近一次已知可用规则。"
+    if [[ -s "$runtime_snap" ]]; then
+      nft -f "$runtime_snap" >/dev/null 2>&1 || true
+    fi
+    rm -f "$compiled" "$tx"
+    rm -f "$rules_snap" "$preview_snap" "$runtime_snap"
+    return 1
+  fi
+
+  if ! apply_sysctl_targets; then
+    log_warn "sysctl 同步失败，但 nft 规则已生效。请手动检查：$SYSCTL_FILE"
+  fi
+
+  atomic_install_file "$compiled" "$COMPILED_PREVIEW_FILE" 600 || restore_file_from_snapshot "$COMPILED_PREVIEW_FILE" "$preview_snap" || true
+  atomic_install_file "$compiled" "$NFT_RULE_FILE" 600 || restore_file_from_snapshot "$NFT_RULE_FILE" "$rules_snap" || true
+  save_last_active_ruleset "$compiled" || restore_file_from_snapshot "$LAST_ACTIVE_RULESET_FILE" "$runtime_snap" || true
+  write_loader_script || true
+
+  rm -f "$compiled" "$tx"
+  rm -f "$rules_snap" "$preview_snap" "$runtime_snap"
+  log_ok "规则已安全应用。"
+}
+
+show_status() {
+  load_settings
+  ensure_dirs_and_files
+  echo
+  echo "目录: $CONF_DIR"
+  echo "表名: inet/$TABLE_FW ip/$TABLE_NAT"
+  echo "INPUT_POLICY=$INPUT_POLICY"
+  echo "FORWARD_POLICY=$FORWARD_POLICY"
+  echo "OUTPUT_POLICY=$OUTPUT_POLICY"
+  echo "WAN_IFACE=${WAN_IFACE:-<unset>}"
+  echo "AUTO_OPEN_SSH_PORT=$AUTO_OPEN_SSH_PORT"
+  echo "ENABLE_IPV6_FORWARD=$ENABLE_IPV6_FORWARD"
+  echo "ENABLE_COUNTERS=$ENABLE_COUNTERS"
+  echo "MANAGEMENT_PORTS=${MANAGEMENT_PORTS:-<unset>}"
+  echo "forward entries=$(count_forward_entries)"
+  echo
+  nft list table inet "$TABLE_FW" >/dev/null 2>&1 && echo "inet/$TABLE_FW: present" || echo "inet/$TABLE_FW: absent"
+  nft list table ip "$TABLE_NAT" >/dev/null 2>&1 && echo "ip/$TABLE_NAT: present" || echo "ip/$TABLE_NAT: absent"
+  echo
+}
+
+show_help() {
+  cat <<'EOF_HELP'
+用法:
+  nftables-manager.safe.sh init
+  nftables-manager.safe.sh preview
+  nftables-manager.safe.sh apply
+  nftables-manager.safe.sh rollback
+  nftables-manager.safe.sh status
+  nftables-manager.safe.sh install-service
+  nftables-manager.safe.sh uninstall-service
+  nftables-manager.safe.sh backup
+  nftables-manager.safe.sh restore-latest
+  nftables-manager.safe.sh edit <settings|allow|allow-range|acl|forward|block-ip|block-port|ratelimit|connlimit|trace|management|auto-rescue>
+  nftables-manager.safe.sh menu
+
+文件格式:
+  allow.list:
+    tcp 22
+    udp 53
+    443/tcp
+    both:8443
+
+  allow_range.list:
+    tcp 10000-10100
+
+  allow_acl.list:
+    192.168.1.0/24 tcp 22
+    tcp 443 10.0.0.0/8
+
+  forward.list:
+    8443 tcp 192.168.1.10 443
+    tcp 2222 192.168.1.20 22
+
+  block_ip.list:
+    1.2.3.4
+    10.0.0.0/8
+
+  block_port.list:
+    tcp 23
+    udp 1900
+
+  ratelimit.list:
+    tcp 22 20/second 40
+    udp 53 100/second
+
+  connlimit.list:
+    tcp 22 50
+
+  management.list:
+    tcp 22
+    tcp 443
+
+  settings.conf 关键项:
+    INPUT_POLICY, FORWARD_POLICY, OUTPUT_POLICY
+    ENABLE_DROP_LOG, DROP_LOG_RATE
+    WAN_IFACE
+    AUTO_OPEN_SSH_PORT
+    ALLOW_PING_V4, PING_V4_RATE
+    ALLOW_PING_V6, ALLOW_IPV6_ND, ENABLE_IPV6_FORWARD
+    WARN_IPTABLES_NAT_CONFLICT, ENABLE_COUNTERS
+    MANAGEMENT_PORTS="tcp:22,tcp:443"
+EOF_HELP
+}
+
+menu_loop() {
+  while true; do
+    cat <<'EOF_MENU'
+
+==== nftables manager (safe) ====
+1) 状态
+2) 编辑 settings.conf
+3) 编辑 allow.list
+4) 编辑 forward.list
+5) 编辑 management.list
+6) 预览编译规则
+7) 应用规则
+8) 回滚到最近可用规则
+9) 安装 systemd service
+10) 卸载 systemd service
+11) 创建备份
+12) 恢复最近备份
+0) 退出
+EOF_MENU
+    read -r -p '选择: ' choice
+    case "$choice" in
+      1) show_status ;;
+      2) edit_file "$SETTINGS_FILE" ;;
+      3) edit_file "$ALLOW_FILE" ;;
+      4) edit_file "$FORWARD_FILE" ;;
+      5) edit_file "$MANAGEMENT_FILE" ;;
+      6) preview_ruleset ;;
+      7) apply_rules ;;
+      8) rollback_last_active ;;
+      9) install_service ;;
+      10) uninstall_service ;;
+      11) backup_configs ;;
+      12) restore_latest_backup ;;
+      0) break ;;
+      *) log_warn "无效选择。" ;;
+    esac
+  done
+}
+
+main() {
+  require_root
+  require_cmd nft
+  acquire_global_lock || die "已有另一个 nft_manager 实例在运行。"
+  load_settings
+  ensure_dirs_and_files
+  warn_nat_conflict
+
+  case "${1:-menu}" in
+    init)
+      save_settings
+      regenerate_auto_rescue_file
+      write_loader_script
+      log_ok "初始化完成。"
+      ;;
+    preview)
+      preview_ruleset
+      ;;
+    apply)
+      apply_rules
+      ;;
+    rollback)
+      rollback_last_active
+      ;;
+    status)
+      show_status
+      ;;
+    install-service)
+      install_service
+      ;;
+    uninstall-service)
+      uninstall_service
+      ;;
+    backup)
+      backup_configs
+      ;;
+    restore-latest)
+      restore_latest_backup
+      ;;
+    edit)
+      case "${2:-}" in
+        settings) edit_file "$SETTINGS_FILE" ;;
+        allow) edit_file "$ALLOW_FILE" ;;
+        allow-range) edit_file "$ALLOW_RANGE_FILE" ;;
+        acl) edit_file "$ALLOW_ACL_FILE" ;;
+        forward) edit_file "$FORWARD_FILE" ;;
+        block-ip) edit_file "$BLOCK_IP_FILE" ;;
+        block-port) edit_file "$BLOCK_PORT_FILE" ;;
+        ratelimit) edit_file "$RATELIMIT_FILE" ;;
+        connlimit) edit_file "$CONNLIMIT_FILE" ;;
+        trace) edit_file "$TRACE_FILE" ;;
+        management) edit_file "$MANAGEMENT_FILE" ;;
+        auto-rescue) edit_file "$AUTO_RESCUE_FILE" ;;
+        *) show_help; exit 1 ;;
+      esac
+      ;;
+    menu)
+      menu_loop
+      ;;
+    -h|--help|help)
+      show_help
+      ;;
+    *)
+      show_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
