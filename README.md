@@ -1,8 +1,8 @@
 chatgpt plus搓的
 
-chmod +x /root/nft-manager
+chmod +x /root/nftables-manager
 
-bash /root/nft-manager
+bash /root/nftables-manager
 
 systemctl daemon-reload
 systemctl enable nft-manager.service
