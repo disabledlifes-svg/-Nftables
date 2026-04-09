@@ -1,5 +1,10 @@
 chatgpt plus搓的
 
+sudo apt update
+sudo apt install -y nftables curl
+
+sudo curl -fsSL -o /root/nft-manager.sh \ https://raw.githubusercontent.com/disabledlifes-svg/self-nftables/refs/heads/main/nft-manager.sh
+
 chmod +x /root/nft-manager.sh
 
 bash /root/nft-manager.sh
