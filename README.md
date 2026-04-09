@@ -7,6 +7,18 @@ https://raw.githubusercontent.com/disabledlifes-svg/self-nftables/refs/heads/mai
 
 bash nft-manager.sh
 
+开启端口转发功能前提
+
+mkdir -p /etc/nft_manager
+cat >/etc/nft_manager/settings.conf <<'EOF'
+WAN_IFACE=eth0
+ENABLE_FORWARD_SNAT=yes
+EOF
+
+sudo /root/nft-manager.sh preview
+sudo nft -c -f /etc/nft_manager/rules.preview.nft
+sudo /root/nft-manager.sh apply
+
 systemctl daemon-reload
 
 systemctl enable nft-manager.service
