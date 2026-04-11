@@ -1,6 +1,6 @@
 chatgpt plus搓的
 
-任何改动记得选项3应用一遍
+任何改动记得先选项2预览一遍没问题再选项3应用一遍
 
 
 sudo wget -O nft-manager.sh \
